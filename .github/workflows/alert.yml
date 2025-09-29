@@ -2,7 +2,7 @@ name: Daily Fund MA Alert
 
 on:
   schedule:
-    - cron: '30 6 * * *'   # 06:30 UTC = 14:30 北京时间（每天）
+    - cron: '30 6 * * *'   # 06:30 UTC = 14:30 北京时间
   workflow_dispatch:
 
 jobs:
@@ -12,7 +12,7 @@ jobs:
       SERVERCHAN_SCKEY: ${{ secrets.SERVERCHAN_SCKEY }}
       WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
