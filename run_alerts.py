@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_alerts.py
-- 从 config.json 读取组合
-- 用东财 pingzhongdata 抓历史净值（主），若失败则用新浪页面抓（备）
-- 计算组合净值、180 日移动平均；若最新净值 < MA180 则发送推送（Server酱 / 企业微信 webhook）
+优化版 run_alerts.py
+- 更健壮的新浪解析（忽略赎回状态、非标准日期）
+- 组合计算时容错：忽略缺失基金，继续算
 """
 import os
 import json
@@ -48,108 +47,110 @@ def fetch_from_eastmoney(code:str, start_date:str, end_date:str, timeout=8):
     url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js?v={int(time.time()*1000)}"
     headers = HEADERS_COMMON.copy()
     headers["Referer"] = f"https://fund.eastmoney.com/{code}.html"
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        text = r.text
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    text = r.text
 
-        # 累计净值
-        m_ac = re.search(r'var\s+Data_ACWorthTrend\s*=\s*(\[.*?\])\s*;', text, flags=re.S)
-        if m_ac:
-            arr = json.loads(m_ac.group(1))
-            dates = [ms_to_date(int(item[0])) for item in arr]
-            vals = [float(item[1]) for item in arr]
-            return pd.Series(vals, index=pd.to_datetime(dates), name=code).sort_index()
+    # 累计净值
+    m_ac = re.search(r'var\s+Data_ACWorthTrend\s*=\s*(\[.*?\])\s*;', text, flags=re.S)
+    if m_ac:
+        arr = json.loads(m_ac.group(1))
+        dates = [ms_to_date(int(item[0])) for item in arr]
+        vals = [float(item[1]) for item in arr]
+        return pd.Series(vals, index=pd.to_datetime(dates), name=code).sort_index()
 
-        # 单位净值
-        m_net = re.search(r'var\s+Data_netWorthTrend\s*=\s*(\[.*?\])\s*;', text, flags=re.S)
-        if m_net:
-            arr = json.loads(m_net.group(1))
-            dates = [ms_to_date(int(item["x"])) for item in arr]
-            vals = [float(item["y"]) for item in arr]
-            return pd.Series(vals, index=pd.to_datetime(dates), name=code).sort_index()
+    # 单位净值
+    m_net = re.search(r'var\s+Data_netWorthTrend\s*=\s*(\[.*?\])\s*;', text, flags=re.S)
+    if m_net:
+        arr = json.loads(m_net.group(1))
+        dates = [ms_to_date(int(item["x"])) for item in arr]
+        vals = [float(item["y"]) for item in arr]
+        return pd.Series(vals, index=pd.to_datetime(dates), name=code).sort_index()
 
-        raise RuntimeError("EastMoney: 未匹配到净值数据")
-    except Exception as e:
-        LOG.debug("EastMoney fetch error for %s: %s", code, e)
-        raise
+    raise RuntimeError("EastMoney: 未匹配到净值数据")
 
 # ---------------- 数据源 B：新浪页面解析 ----------------
 def fetch_from_sina(code:str, start_date:str, end_date:str, timeout=8):
     url = f"https://stock.finance.sina.com.cn/fundInfo/view/FundInfo_LSJZ.php?symbol={code}"
     headers = HEADERS_COMMON.copy()
     headers["Referer"] = "https://finance.sina.com.cn/"
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    html = r.text
+
+    dfs = []
     try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        html = r.text
+        dfs = pd.read_html(StringIO(html))
+    except Exception:
+        pass
 
-        # 先尝试 pandas.read_html
-        dfs = []
+    target_df = None
+    for df in dfs:
+        cols = [str(c) for c in df.columns]
+        if any("净值" in c for c in cols):
+            target_df = df
+            break
+
+    if target_df is None:
+        soup = BeautifulSoup(html, "lxml")
+        tables = soup.find_all("table")
+        for t in tables:
+            try:
+                df_try = pd.read_html(StringIO(str(t)))[0]
+                cols = [str(c) for c in df_try.columns]
+                if any("净值" in c for c in cols):
+                    target_df = df_try
+                    break
+            except Exception:
+                continue
+
+    if target_df is None or target_df.empty:
+        raise RuntimeError("新浪未解析到净值表格")
+
+    # 拍平多级表头
+    if isinstance(target_df.columns, pd.MultiIndex):
+        target_df.columns = ["".join([str(c) for c in tup]) for tup in target_df.columns]
+
+    # 找列
+    date_col, nav_col = None, None
+    for c in target_df.columns:
+        s = str(c)
+        if any(k in s for k in ["日期", "时间"]):
+            date_col = c
+        if any(k in s for k in ["累计净值", "单位净值", "基金净值", "净值"]):
+            nav_col = c
+    if not date_col or not nav_col:
+        raise RuntimeError("新浪解析：未找到日期列或净值列")
+
+    df_clean = target_df[[date_col, nav_col]].dropna()
+
+    # 过滤掉非日期字符串
+    def safe_date(x):
         try:
-            dfs = pd.read_html(StringIO(html))
+            return pd.to_datetime(x, errors="raise")
         except Exception:
-            pass
+            return pd.NaT
 
-        target_df = None
-        for df in dfs:
-            cols = [str(c) for c in df.columns]
-            if any("净值" in c for c in cols):
-                target_df = df
-                break
+    df_clean[date_col] = df_clean[date_col].apply(safe_date)
+    df_clean = df_clean.dropna(subset=[date_col])
 
-        # 如果 pandas 没解析成功，用 BeautifulSoup
-        if target_df is None:
-            soup = BeautifulSoup(html, "lxml")
-            tables = soup.find_all("table")
-            for t in tables:
-                try:
-                    df_try = pd.read_html(StringIO(str(t)))[0]
-                    cols = [str(c) for c in df_try.columns]
-                    if any("净值" in c for c in cols):
-                        target_df = df_try
-                        break
-                except Exception:
-                    continue
+    df_clean[nav_col] = pd.to_numeric(df_clean[nav_col].astype(str).str.replace('%',''), errors='coerce')
+    df_clean = df_clean.dropna(subset=[nav_col])
 
-        if target_df is None or target_df.empty:
-            raise RuntimeError("新浪未解析到净值表格")
-
-        # 拍平多级表头
-        if isinstance(target_df.columns, pd.MultiIndex):
-            target_df.columns = ["".join([str(c) for c in tup]) for tup in target_df.columns]
-
-        # 寻找日期/净值列
-        date_col, nav_col = None, None
-        for c in target_df.columns:
-            s = str(c)
-            if any(k in s for k in ["日期", "时间"]):
-                date_col = c
-            if any(k in s for k in ["累计净值", "单位净值", "基金净值", "净值"]):
-                nav_col = c
-        if not date_col or not nav_col:
-            raise RuntimeError("新浪解析：未找到日期列或净值列")
-
-        target_df = target_df[[date_col, nav_col]].dropna()
-        target_df[date_col] = pd.to_datetime(target_df[date_col])
-        target_df[nav_col] = pd.to_numeric(target_df[nav_col].astype(str).str.replace('%',''), errors='coerce')
-        series = pd.Series(target_df[nav_col].values, index=target_df[date_col].dt.normalize(), name=code).sort_index()
-        sdate, edate = pd.to_datetime(start_date), pd.to_datetime(end_date)
-        return series[(series.index >= sdate) & (series.index <= edate)]
-    except Exception as e:
-        LOG.debug("Sina fetch error for %s: %s", code, e)
-        raise
+    series = pd.Series(df_clean[nav_col].values, index=df_clean[date_col].dt.normalize(), name=code).sort_index()
+    sdate, edate = pd.to_datetime(start_date), pd.to_datetime(end_date)
+    return series[(series.index >= sdate) & (series.index <= edate)]
 
 # ---------------- 单只基金统一抓取 ----------------
 def fetch_single_fund_nav(code:str, start_date:str, end_date:str, retries=2):
     last_err = None
-    for attempt in range(retries):
+    for _ in range(retries):
         try:
             return fetch_from_eastmoney(code, start_date, end_date)
         except Exception as e:
             last_err = e
             time.sleep(0.5)
-    for attempt in range(retries):
+    for _ in range(retries):
         try:
             return fetch_from_sina(code, start_date, end_date)
         except Exception as e:
@@ -235,18 +236,20 @@ def main(debug=False):
     for pname, pconf in portfolios.items():
         LOG.info("处理组合：%s", pname)
         funds = pconf.get("funds", {})
-        if not funds:
-            LOG.warning("%s 没有 funds，跳过", pname)
+        codes = [c for c in funds.keys() if c in nav_df.columns]
+
+        if not codes:
+            LOG.warning("%s 的所有基金都缺失，跳过", pname)
             continue
-        codes = list(funds.keys())
+
         sub_nav = nav_df.reindex(columns=codes).ffill().dropna(how="any")
         if sub_nav.empty:
             LOG.warning("%s 的数据不足，跳过", pname)
             continue
 
-        weights = pd.Series(funds, dtype=float)
-        if abs(weights.sum() - 1.0) > 1e-8:
-            weights = weights / weights.sum()
+        weights = pd.Series({c: funds[c] for c in codes}, dtype=float)
+        weights = weights / weights.sum()  # 归一化
+
         initial_cap = float(pconf.get("initial_capital", default_cap))
         start_prices = sub_nav.iloc[0]
         units = {c: initial_cap * weights[c] / start_prices[c] for c in codes}
