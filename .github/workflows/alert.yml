@@ -2,7 +2,7 @@ name: Daily Fund MA Alert
 
 on:
   schedule:
-    - cron: '30 6 * * *'   # 06:30 UTC = 14:30 北京时间
+    - cron: '0 4 * * *'   # 每天 12:00 北京时间
   workflow_dispatch:
 
 jobs:
