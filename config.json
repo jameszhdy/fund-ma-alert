@@ -1,5 +1,5 @@
 {
-  "roll_window": 100,
+  "roll_window": 60,
   "initial_capital_default": 100000,
   "fetch_days_back": 800,
   "portfolios": {
@@ -197,5 +197,6 @@
     }
   }
 }
+
 
 
